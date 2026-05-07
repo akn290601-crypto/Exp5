@@ -5,7 +5,8 @@
 // 運用想定:
 //   各担当者が自分のGoogleアカウントでこのGASをコピーして実行する
 //   全員が同じ DRIVE_FOLDER_ID / SPREADSHEET_ID を向く
-//   重複チェック: 送信者メールアドレス + ファイル名 + 受信日 が同じものはスキップ
+//   重複チェック: PDFのMD5ハッシュ（コンテンツ一致）
+//                ファイル名変更・転送経路が違っても同一PDFを検出できる
 // =====================================================================
 
 var CONFIG = {
@@ -37,8 +38,8 @@ function organizeInvoices() {
   var processedLabel = getOrCreateLabel(CONFIG.PROCESSED_LABEL);
   var currentAccount = Session.getActiveUser().getEmail();
 
-  // スプレッドシートから既存の重複キーを先読みする（API呼び出し最小化）
-  var existingKeys = loadExistingKeys(sheet);
+  // 既存のPDFハッシュ一覧をスプレッドシートから先読み
+  var existingHashes = loadExistingHashes(sheet);
 
   var query = CONFIG.GMAIL_QUERY + ' -label:' + CONFIG.PROCESSED_LABEL;
   var threads = GmailApp.search(query, 0, CONFIG.MAX_THREADS);
@@ -59,21 +60,19 @@ function organizeInvoices() {
       attachments.forEach(function(attachment) {
         if (!isPdfAttachment(attachment)) return;
 
-        var dupKey = buildDuplicateKey(
-          extractEmail(message.getFrom()),
-          attachment.getName(),
-          message.getDate()
-        );
+        // ブロブを一度だけ読む（ハッシュ計算とDrive保存で共用）
+        var blob = attachment.copyBlob();
+        var hash = computePdfHash(blob);
 
-        if (existingKeys[dupKey]) {
-          Logger.log("重複スキップ: " + attachment.getName() + " (" + message.getFrom() + ")");
+        if (existingHashes[hash]) {
+          Logger.log("重複スキップ (ハッシュ一致): " + attachment.getName());
           return;
         }
 
-        var result = saveAttachmentToDrive(attachment, message, folder, currentAccount);
+        var result = saveBlobToDrive(blob, attachment.getName(), message, folder, currentAccount, hash);
         if (result) {
           newRows.push(result);
-          existingKeys[dupKey] = true; // 同一実行内での重複も防ぐ
+          existingHashes[hash] = true; // 同一実行内の重複も防ぐ
           Logger.log("保存完了: " + result.fileName);
         }
       });
@@ -91,19 +90,9 @@ function organizeInvoices() {
 // =====================================================================
 // PDFをDriveに保存してメタデータを返す
 // =====================================================================
-function saveAttachmentToDrive(attachment, message, folder, account) {
+function saveBlobToDrive(blob, originalName, message, folder, account, hash) {
   try {
-    var rawName = attachment.getName();
-    var safeName = sanitizeFileName(rawName, message.getDate());
-
-    // Driveの同名ファイルチェック（別アカウントが先に保存済みの場合）
-    var existing = folder.getFilesByName(safeName);
-    if (existing.hasNext()) {
-      Logger.log("Drive既存ファイルをスキップ: " + safeName);
-      return null;
-    }
-
-    var blob = attachment.copyBlob();
+    var safeName = sanitizeFileName(originalName, message.getDate());
     var file = folder.createFile(blob.setName(safeName));
 
     return {
@@ -114,50 +103,38 @@ function saveAttachmentToDrive(attachment, message, folder, account) {
       fileUrl: file.getUrl(),
       savedAt: Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy/MM/dd HH:mm:ss"),
       account: account,
+      hash: hash,
     };
   } catch (e) {
-    Logger.log("保存エラー (" + attachment.getName() + "): " + e.message);
+    Logger.log("保存エラー (" + originalName + "): " + e.message);
     return null;
   }
 }
 
 // =====================================================================
-// 重複チェック用ヘルパー
+// PDFハッシュ（MD5）の計算・管理
 // =====================================================================
 
-// スプレッドシートの既存行から重複キーのセットを作る
-function loadExistingKeys(sheet) {
+function computePdfHash(blob) {
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, blob.getBytes());
+  return digest.map(function(b) {
+    return ('0' + (b & 0xFF).toString(16)).slice(-2);
+  }).join('');
+}
+
+// スプレッドシートの「PDFハッシュ」列から既存ハッシュを読み込む
+function loadExistingHashes(sheet) {
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return {};
 
-  // 列: 受信日(1) 送信者(2) 件名(3) ファイル名(4)
-  var data = sheet.getRange(2, 1, lastRow - 1, 4).getValues();
-  var keys = {};
+  // PDFハッシュ列（8列目）だけ取得
+  var data = sheet.getRange(2, 8, lastRow - 1, 1).getValues();
+  var hashes = {};
   data.forEach(function(row) {
-    var date = String(row[0]);
-    var senderEmail = extractEmail(String(row[1]));
-    var savedName = String(row[3]);
-    var originalName = savedName.replace(/^\d{8}_/, ""); // 日付プレフィックスを除去
-    keys[buildDuplicateKeyFromParts(date, senderEmail, originalName)] = true;
+    var h = String(row[0]).trim();
+    if (h) hashes[h] = true;
   });
-  return keys;
-}
-
-// 重複キーを生成（メール処理時）
-function buildDuplicateKey(senderEmail, originalFileName, date) {
-  var dateStr = Utilities.formatDate(date, Session.getScriptTimeZone(), "yyyy/MM/dd");
-  return buildDuplicateKeyFromParts(dateStr, senderEmail, originalFileName);
-}
-
-// 重複キーを生成（既存データ参照時）
-function buildDuplicateKeyFromParts(dateStr, senderEmail, fileName) {
-  return [dateStr, senderEmail.toLowerCase(), fileName.toLowerCase()].join("|");
-}
-
-// "Display Name <email@example.com>" からメールアドレスのみ抽出
-function extractEmail(from) {
-  var match = from.match(/<(.+?)>/);
-  return match ? match[1].toLowerCase() : from.toLowerCase().trim();
+  return hashes;
 }
 
 // =====================================================================
@@ -206,7 +183,7 @@ function getOrCreateSheet() {
   var sheet = ss.getSheetByName(CONFIG.SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(CONFIG.SHEET_NAME);
-    var headers = ["受信日", "送信者", "件名", "ファイル名", "DriveリンクURL", "保存日時", "処理アカウント", "仕訳ステータス"];
+    var headers = ["受信日", "送信者", "件名", "ファイル名", "DriveリンクURL", "保存日時", "処理アカウント", "PDFハッシュ", "仕訳ステータス"];
     sheet.appendRow(headers);
     sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
     sheet.setFrozenRows(1);
@@ -224,6 +201,7 @@ function appendToSheet(sheet, rows) {
       row.fileUrl,
       row.savedAt,
       row.account,
+      row.hash,
       "未処理",
     ]);
   });
